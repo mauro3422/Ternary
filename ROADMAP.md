@@ -165,7 +165,7 @@ Formato packed 2-bit: cada byte almacena 4 pesos ternarios. Mapeo: 0→-1, 1→0
 
 | Experimento | Qué |
 |---|---|
-| **MatMul-Free (HGRN)** | Reemplazar atención + MLP por HGRN (gated RNN). Sin multiplicaciones de matrices, solo sumas/restas. Compite con Transformers hasta ~1B params. O(n) en inferencia. **Recomendado como próximo paso**. |
+| **MatMul-Free (HGRN)** | ✅ Implementado en Python (`model.py`). RNN con forget gate jerárquico, O(n) inferencia. Pendiente: implementar en motor C y entrenar 85M. |
 | **MoE ternario** | Varios expertos ternarios chicos, router aprende a elegir |
 | **Dataset TinyStories** | Vocabulario ~1000 tokens, modelo aprende a contar historias |
 | **JSON estructurado** | Entrenar en datos con formato para que genere JSON válido |
