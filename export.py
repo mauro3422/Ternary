@@ -8,7 +8,17 @@ import sys
 import struct
 import math
 import torch
-from config import GPTConfig
+
+if len(sys.argv) > 1:
+    config_module = __import__(sys.argv[1])
+else:
+    config_module = __import__('config')
+GPTConfig = None
+for attr in dir(config_module):
+    if attr.endswith('Config'):
+        GPTConfig = getattr(config_module, attr)
+        break
+
 from model import GPT, ternarize
 
 def pack_ternary(weights):

@@ -11,7 +11,21 @@ import math
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from config import GPTConfig
+
+# Permitir override de config via argumento: python train.py config_350m_hgrn
+if len(sys.argv) > 1:
+    config_module = __import__(sys.argv[1])
+else:
+    config_module = __import__('config')
+GPTConfig = None
+for attr in dir(config_module):
+    if attr.endswith('Config'):
+        GPTConfig = getattr(config_module, attr)
+        break
+if GPTConfig is None:
+    raise ImportError("No se encontró clase *Config en el módulo")
+print(f"Usando config: {config_module.__name__}.{GPTConfig.__name__}")
+
 from model import GPT, BitLinear
 
 # -----------------------------------------------------------------------------

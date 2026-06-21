@@ -6,7 +6,17 @@ Carga el checkpoint y genera texto interactivo.
 import os
 import sys
 import torch
-from config import GPTConfig
+
+if len(sys.argv) > 1:
+    config_module = __import__(sys.argv[1])
+else:
+    config_module = __import__('config')
+GPTConfig = None
+for attr in dir(config_module):
+    if attr.endswith('Config'):
+        GPTConfig = getattr(config_module, attr)
+        break
+
 from model import GPT
 from train import CharDataset, get_shakespeare
 
