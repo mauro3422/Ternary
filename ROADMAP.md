@@ -16,9 +16,9 @@ Crear un transformer ternario {-1, 0, +1} completo: desde el entrenamiento hasta
 | 1.2 | `model.py` | ✅ GPT + BitLinear con STE (Straight-Through Estimator) |
 | 1.3 | `train.py` | ✅ Training loop sobre Shakespeare |
 | 1.4 | `sample.py` | ✅ Generación de texto con el modelo entrenado |
-| **1.5** | **Entrenar** | ⏳ Ejecutar en PC con GPU (10-30 min) |
-| **1.6** | **Evaluar** | ⏳ Verificar que aprende (loss baja, texto coherente) |
-| **1.7** | **Exportar a GGUF** | ⏳ Script que convierte los pesos a `i2_s` (formato ternario GGUF) |
+| **1.5** | **Entrenar** | ✅ Ejecutado en Colab GPU T4 (loss 2.47, PPL 11.80) |
+| **1.6** | **Evaluar** | ✅ Loss baja progresivamente, genera texto con estructura |
+| **1.7** | **Exportar** | ✅ `export.py` convierte checkpoint a binario ternario (3 MB) |
 
 **Dependencias:** PyTorch, numpy (ya instalado)
 
@@ -35,29 +35,63 @@ Cada peso ternario almacena solo log₂(3) ≈ 1.58 bits. Para igualar la capaci
 
 **Conclusión:** 10.7M es prueba de concepto. Para algo útil hay que escalar. Ternario es una compensación: menos bits por peso, pero los pesos se pueden hacer muy pequeños (1.58 bits) y la inferencia es rapidísima en SSE4.2.
 
-#### GELU en el motor C
-La activación GELU en el MLP (`model.py`) usa multiplicaciones de floats. Para la Fase 2 (motor C), hay que decidir:
-- **Opción A:** Lookup table de GELU (pre-calcular valores, ocupa ~1KB)
-- **Opción B:** Reemplazar por ReLU (solo `max(0, x)`, pura comparación)
-- **Opción C:** MatMul-Free (Fase 4 experimental, elimina atención y MLP por RNN)
+#### Atención cuadrática vs lineal
+Para contexto corto (256 tokens), la atención cuadrática O(n²) es rápida y precisa. Para contexto largo conviene HGRN/RWKV (lineal O(n)). Decidimos mantener atención cuadrática con KV cache para la Fase 2, y explorar MatMul-Free (HGRN) en Fase 4.
 
-Por ahora dejamos GELU. En el motor C usaremos una lookup table.
+#### GELU en el motor C
+La activación GELU en el MLP usa multiplicaciones de floats. En el motor C se implementó con **lookup table de 1024 entradas** (4KB, cabe en L1 cache). Alternativa futura: ReLU (más barato, requiere reentrenar el modelo).
 
 ---
 
-## Fase 2: Motor de Inferencia Custom en C
+## Fase 2: Motor de Inferencia Custom en C ✅
 
 | Paso | Archivo | Qué |
 |---|---|---|
-| 2.1 | `engine/tensor.h` | Struct Tensor + operaciones básicas (crear, copiar, free) |
-| 2.2 | `engine/gguf.h` | Parser de GGUF (leer pesos del archivo) |
-| 2.3 | `engine/ternary.h` | SSE4.2 intrinsics para matmul ternario (`_mm_sign_epi8`) |
-| 2.4 | `engine/transformer.h` | Forward pass completo (embed → attn → ffn → head) |
-| 2.5 | `engine/sampler.h` | Sampling (top-k, temperatura, softmax) |
-| 2.6 | `engine/main.c` | CLI: prompt → generate tokens |
-| 2.7 | `engine/Makefile` | Build: `gcc -msse4.2 -O2 main.c -o tern` |
+| 2.1 | `engine/tensor.h` | ✅ Struct Tensor + alloc/free + lectura de binario |
+| 2.2 | `engine/ternary.h` | ✅ I2_S: pre-desempaqueta ternarios a int8, matmul con `_mm_sign_epi8` |
+| 2.3 | `engine/kv_cache.h` | ✅ KV Cache: guarda K,V entre pasos, ~5-10× speedup |
+| 2.4 | `engine/sampler.h` | ✅ Softmax con LUT (fast_exp), top-k, temperatura |
+| 2.5 | `engine/transformer.h` | ✅ Forward pass + prefill + decode con multi-thread |
+| 2.6 | `engine/main.c` | ✅ CLI con -m, -p, -n, -t, -k |
+| 2.7 | `engine/Makefile` | ✅ `gcc -msse4.2 -O2 main.c -o tern -lm -lpthread` |
+| 2.8 | `export.py` | ✅ Exporta checkpoint de PyTorch a `model.bin` |
 
-**Target:** Binario < 100KB, 0 dependencias externas
+**Target:** Binario < 300KB (con pthread estático), dependencias: libc + libm + pthread
+
+### Optimizaciones implementadas
+
+#### I2_S (Int2 with Scale)
+En vez de desempaquetar pesos ternarios 2-bit en cada multiplicación (lento), los pre-desempaquetamos a int8 al cargar el modelo. Ocupa 4× más RAM (3MB → 12MB) pero elimina el cuello de botella de desempaquetado, dando ~10× de speedup.
+
+#### KV Cache
+Sin KV cache, cada token reprocesa el prompt completo desde cero. Con KV cache:
+- **Prefill:** procesa el prompt una sola vez, guarda K y V de cada capa
+- **Decode:** solo procesa 1 token nuevo, atención contra cache
+- Speedup: ~5-10× para generación larga
+
+#### Multi-threading
+El Celeron N4020 tiene 2 cores físicos. Usamos pthreads para partir los matmuls (QKV, MLP) en 2 threads. Speedup: ~1.5-2×.
+
+#### Lookup Tables
+- **Softmax:** LUT de 256 entradas para exp() (rango [-16, 16], error < 0.1%)
+- **GELU:** LUT de 1024 entradas (4KB, error < 0.1%)
+
+### Bugs encontrados y corregidos
+
+1. **`_mm_sad_epu8` usado como suma:** Esta instrucción suma valores ABSOLUTOS, no valores reales. Corregido usando `_mm_cvtepi8_epi16` + `_mm_madd_epi16`.
+2. **Buffer overflow en x_int8:** Se alocaba con `n_embd` (384) pero el MLP fc necesita `4*n_embd` (1536). Causaba HEAP_CORRUPTION.
+3. **Residual connection faltante:** Después del attention output projection, faltaba `x = residual + attn_out` y RMSNorm 2. Causaba ACCESS_VIOLATION.
+4. **Formato binario con vistas corruptas:** El buffer mmap se corrompía al mezclar vistas. Corregido copiando los datos a tensores propios.
+5. **`_mm_sign_epi8` es SSSE3, no SSE4.2:** El include correcto es `<tmmintrin.h>`, no `<smmintrin.h>`. Ambos están disponibles en el N4020.
+
+### Rendimiento (Ryzen 5600G)
+
+| Versión | 50 tokens | Tok/s |
+|---|---|---|
+| Sin optimizar | 1.92s | 26 |
+| Con KV cache + MT | **0.37s** | **136** |
+
+Estimado en N4020: **20-40 tok/s**
 
 ### SSE4.2 intrinsics clave
 
@@ -72,16 +106,38 @@ __m128i sign = _mm_sign_epi8(valores, mascara_ternaria);
 __m128i sum = _mm_hadd_epi32(a, b);
 ```
 
+### Formato binario (model.bin)
+
+```
+MAGIC: "TERN" (4 bytes)
+HEADER: vocab_size, block_size, n_layer, n_head, n_embd (20 bytes)
+STOI: tabla ASCII 256 bytes (char→token_id)
+ITOS: vocab_size bytes (token_id→char)
+TENSORS: [size(4)] [data(size)] para cada tensor
+  - wte (vocab_size × n_embd, float32)
+  - wpe (block_size × n_embd, float32)
+  - ln_f (n_embd, float32)
+  - por cada layer:
+    - ln_1, ln_2 (n_embd, float32)
+    - c_attn (3*n_embd × n_embd, packed 2-bit)
+    - c_proj (n_embd × n_embd, packed 2-bit)
+    - mlp_fc (4*n_embd × n_embd, packed 2-bit)
+    - mlp_proj (n_embd × 4*n_embd, packed 2-bit)
+  - lm_head (vocab_size × n_embd, packed 2-bit)
+```
+
+Formato packed 2-bit: cada byte almacena 4 pesos ternarios. Mapeo: 0→-1, 1→0, 2→+1, 3→reservado.
+
 ---
 
 ## Fase 3: Validación
 
-| Paso | Qué |
-|---|---|
-| 3.1 | Cargar modelo entrenado (GGUF) en el motor C |
-| 3.2 | Verificar que da los mismos outputs que PyTorch |
-| 3.3 | Medir tok/s en el N4020 |
-| 3.4 | Comparar vs TinyLlama en llama.cpp |
+| Paso | Qué | Estado |
+|---|---|---|
+| 3.1 | Cargar modelo en motor C | ✅ `model_load` funciona |
+| 3.2 | Generar texto | ✅ Genera texto (aunque sin sentido por modelo chico) |
+| 3.3 | Medir tok/s en el N4020 | ⏳ Pendiente |
+| 3.4 | Comparar vs TinyLlama en llama.cpp | ⏳ Pendiente |
 
 ---
 
@@ -89,55 +145,58 @@ __m128i sum = _mm_hadd_epi32(a, b);
 
 | Experimento | Qué |
 |---|---|
-| **MatMul-Free** | Reemplazar atención + MLP por HGRN (gated RNN). Sin multiplicaciones de matrices, solo sumas/restas. No es "más tonto", compite con Transformers hasta ~1B params. Ideal para CPU débil porque inferencia es O(n) en vez de O(n²) |
+| **MatMul-Free (HGRN)** | Reemplazar atención + MLP por HGRN (gated RNN). Sin multiplicaciones de matrices, solo sumas/restas. Compite con Transformers hasta ~1B params. O(n) en inferencia. **Recomendado como próximo paso**. |
 | **MoE ternario** | Varios expertos ternarios chicos, router aprende a elegir |
+| **Dataset TinyStories** | Vocabulario ~1000 tokens, modelo aprende a contar historias |
 | **JSON estructurado** | Entrenar en datos con formato para que genere JSON válido |
 | **Distillación** | TinyLlama enseña a nuestro modelo (teacher → student) |
-| **Trainer custom** | Reemplazar PyTorch con un entrenador minimalista en C++/Python. Sin autograd pesado, solo el forward/backward necesario para ternarios. Ideal para modelos chicos (<350M). Menos dependencias, más control, posiblemente más rápido por evitar overhead de Python en los loops |
+| **Trainer custom** | Reemplazar PyTorch con entrenador minimalista en C/puro Python sin autograd pesado |
 
-### Fase 5: Entrenador Custom (visión a futuro)
+### Investigación de arquitecturas eficientes (docs/ARQUITECTURAS_CPU.md)
 
-Idea: crear un `tiny_train` en C++ que haga todo el training loop sin PyTorch.
+Se investigaron las siguientes arquitecturas para CPU débil:
 
-```
-tiny_train/
-├── tensor.h        → Tensor con autograd manual (solo para ternarios)
-├── layers.h        → Solo BitLinear, RMSNorm, atención (lo justo)
-├── optim.h         → AdamW simplificado (solo lo necesario para ternarios)
-├── data.h          → Loader de datasets chicos (Shakespeare, TinyStories)
-├── train.c         → Training loop compacto
-└── Makefile        → build en segundos
-```
+| Arquitectura | Complejidad | KV Cache | Madurez CPU | Ideal para N4020 |
+|---|---|---|---|---|
+| **Transformer ternario (actual)** | O(n²) atención | Sí | ✅ Implementado | Con KV cache sí |
+| **HGRN (MatMul-Free)** | O(n) lineal | No | Académica | ✅ Excelente |
+| **RWKV-7** | O(n) lineal | No | ✅ Producción (rwkv.cpp) | ✅ Bueno |
+| **LFM2 (Liquid AI)** | O(n) convolución | No | Producción (propietario) | ❌ Cerrado |
+| **Mamba** | O(n) SSM | No | Experimental | ❌ Sin ecosistema CPU |
 
-**Ventajas:**
-- Binario < 1MB (vs PyTorch ~3GB)
-- Sin Python overhead en el forward/backward
-- Customizas cada operación (como en inferencia)
-- Ideal para experimentos rápidos y modelos chicos
-- Misma base de código que el motor de inferencia (reutilizás layers)
+**Conclusión:** HGRN (MatMul-Free) es la mejor opción para Fase 4 porque:
+- Ya tenemos los ternarios implementados
+- HGRN es simple de implementar en C (~200 líneas)
+- Sin multiplicaciones float
+- O(n) en inferencia vs O(n²) de atención
+- Benchmarks del paper muestran calidad competitiva con Transformers
 
 ---
 
 ## Stack
 
 ```
-Training:    Python + PyTorch + numpy  (~800KB de código nuestro)
-Formato:     GGUF (i2_s - 1.58-bit ternary)
-Inferencia:  C99 + SSE4.2 intrinsics   (~300 líneas, binario < 100KB)
-Build:       Makefile / gcc
+Training:      Python + PyTorch + numpy + Google Colab
+Formato:       Binario ternario custom (.bin, 1.58-bit)
+Inferencia:    C99 + SSSE3/SSE4.2 intrinsics (~1000 líneas)
+Build:         Makefile / gcc (MinGW o Linux)
+Dependencias:  libm + libpthread
+Tamaño:        Binario ~285KB, modelo 10.7M ~3MB empaquetado / ~12MB pre-desempaquetado
 ```
 
 ## Por qué este enfoque y no llama.cpp
 
 | | llama.cpp | Motor custom |
 |---|---|---|
-| Tamaño binario | ~15MB | **< 100KB** |
-| Dependencias | OpenMP, BLAS, etc | **0** |
+| Tamaño binario | ~15MB | **~0.3MB** |
+| Dependencias | OpenMP, BLAS, etc | **libm + pthread** |
 | Control | Capa abstracta | **Cada byte importa** |
 | SSE4.2 | Fallback genérico | **Kernels hechos a mano** |
 | Ternario | Soporte parcial | **Nativo: {-1,0,+1}** |
-| Curva de aprendizaje | Gigante | **300 líneas, se entiende todo** |
+| Curva de aprendizaje | Gigante | **~1000 líneas, se entiende todo** |
+| Formato | GGUF | **Binario custom minimalista** |
 
 ---
 
 *Inicio: Junio 2026*
+*Última actualización: 21 Junio 2026 — Fase 2 completa (motor C con I2_S, KV cache, MT)*

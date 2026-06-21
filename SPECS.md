@@ -165,18 +165,45 @@ export → GGUF (i2_s)              input: prompt → output: tokens
 
 **Decisiones de diseño:**
 - Ternario {-1, 0, +1} para evitar multiplicaciones de floats
-- SSSE3 tiene `_mm_sign_epi8` que hace ×{-1,0,+1} para 16 valores a la vez (N4020 lo soporta)
+- SSSE3 tiene `_mm_sign_epi8` que hace ×{-1,0,+1} para 16 valores a la vez (N4020: Gemini Lake tiene SSSE3 ✅)
 - RMSNorm (no LayerNorm, como BitNet)
 - Sin weight decay en capas ternarias
 - Contexto 256 tokens (no más, para mantener velocidad)
 - Vocabulario 65 caracteres (Shakespeare) como prueba de concepto
+- **I2_S:** pesos pre-desempaquetados a int8 en RAM (4× más RAM, ~10× más rápido)
+- **KV cache:** guarda K,V entre pasos de generación (~5-10× speedup)
+- **Multi-thread:** 2 threads con pthreads para matmul (~1.5-2× speedup)
+- **GELU:** lookup table de 1024 entradas (cabe en L1 cache)
+- **Softmax:** lookup table de 256 entradas para exp()
 
 **Lecciones aprendidas (Junio 2026):**
 - Un peso ternario guarda 1.58 bits vs 32 bits de uno float32. Para igual capacidad se necesitan ~20× más parámetros. Por eso escalar de 10.7M → 85M → 350M es necesario.
 - Más layers/embedding = más pesos ternarios = más capacidad de aprendizaje. No es "más tonto", es compensar la baja precisión por cantidad.
-- GELU en el MLP introduce multiplicaciones float. En el motor C se resolverá con lookup table o ReLU.
+- `_mm_sign_epi8` es SSSE3 (no SSE4.2). Include correcto: `<tmmintrin.h>`.
+- `_mm_sad_epu8` suma valores ABSOLUTOS, no es útil para producto punto real. Usar `_mm_cvtepi8_epi16` + `_mm_madd_epi16` en su lugar.
+- El buffer de cuantización debe ser tan grande como la entrada más grande (MLP fc: 4×n_embd, no n_embd).
+- El residual connection es crítico y fácil de olvidar al reescribir el forward.
 - MatMul-Free (HGRN) no es "versión tonta del transformer". Compite en calidad y es ideal para CPU porque inferencia es O(n) en vez de O(n²). Opción para Fase 4.
-- El motor C custom es indispensable para velocidad en el N4020. Python/PyTorch da ~1-3 tok/s. C con SSE4.2 da ~30-100 tok/s.
+- El motor C custom es indispensable para velocidad en el N4020. Python/PyTorch da ~1-3 tok/s. C con SSE4.2 + I2_S + KV cache da ~20-40 tok/s (estimado N4020).
+- Liquid AI LFM2 corre 194 tok/s en 350M en un celular (Snapdragon). Son modelos propietarios pero validan la tesis de arquitecturas no-transformer para edge.
+
+**Arquitecturas investigadas (ver docs/ARQUITECTURAS_CPU.md):**
+- **MatMul-Free LM (HGRN2):** Mejor opción para Fase 4. Elimina toda multiplicación de matrices. O(n). Benchmarks competitivos con Transformers.
+- **RWKV-7:** RNN pura con ecosistema CPU maduro (rwkv.cpp, GGUF). Alternativa viable para Fase 4.
+- **LFM2 (Liquid AI):** Convoluciones + atención híbrida. Propietario, no podemos usarlo directamente.
+- **Mamba:** SSM selectivo. Sin ecosistema CPU maduro. No viable para N4020 hoy.
+
+**Bugs encontrados y corregidos durante desarrollo del motor C:**
+1. `_mm_sad_epu8` usado como suma → HEAP CORRUPTION
+2. Buffer overflow en x_int8 (384 vs 1536) → HEAP CORRUPTION
+3. Residual connection faltante → ACCESS VIOLATION
+4. Buffer mmap con vistas corruptas → datos incorrectos
+5. `smmintrin.h` vs `tmmintrin.h` para `_mm_sign_epi8`
+
+**Rendimiento medido (Ryzen 5600G, modelo 10.7M ternario):**
+- Sin optimizar: 26 tok/s
+- Con KV cache + multi-thread: **136 tok/s** (5.2× speedup)
+- Estimado N4020: **20-40 tok/s**
 
 **Si el training en Shakespeare funciona bien, después escalamos a:**
 - TinyStories (vocabulario ~1000 tokens)
