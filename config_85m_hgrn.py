@@ -1,21 +1,21 @@
 """
-Config para entrenar 85M HGRN (MatMul-Free) en Shakespeare.
-12 layers, 768 embedding — ~8× más parámetros que el 10.7M actual.
+Config para entrenar ~80M HGRN (MatMul-Free) en Shakespeare.
+24 layers, 1024 embedding.
 """
 from dataclasses import dataclass
 
 @dataclass
-class HGRN85MConfig:
+class HGRN80MConfig:
     block_size: int = 256
     vocab_size: int = 65
-    n_layer: int = 12
-    n_head: int = 1        # no usado en HGRN, pero necesario por compatibilidad
-    n_embd: int = 768
+    n_layer: int = 24
+    n_head: int = 1
+    n_embd: int = 1024
 
     ternary: bool = True
     use_hgrn: bool = True
 
-    batch_size: int = 16   # reducir para que quepa en 16GB de RAM de Colab
+    batch_size: int = 8
     learning_rate: float = 3e-4
     max_iters: int = 10000
     eval_interval: int = 500
