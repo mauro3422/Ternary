@@ -156,7 +156,7 @@ Formato packed 2-bit: cada byte almacena 4 pesos ternarios. Mapeo: 0→-1, 1→0
 |---|---|---|
 | 3.1 | Cargar modelo en motor C | ✅ `model_load` funciona |
 | 3.2 | Generar texto | ✅ Genera texto (aunque sin sentido por modelo chico) |
-| 3.3 | Medir tok/s en el N4020 | ⏳ Pendiente |
+| 3.3 | Medir tok/s en el N4020 | ✅ **105 tok/s decode** (21 Jun 2026) |
 | 3.4 | Comparar vs TinyLlama en llama.cpp | ⏳ Pendiente |
 
 ---
