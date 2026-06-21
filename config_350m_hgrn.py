@@ -15,7 +15,7 @@ class HGRN350MConfig:
     ternary: bool = True
     use_hgrn: bool = True
 
-    batch_size: int = 2
+    batch_size: int = 1
     learning_rate: float = 2e-4
     max_iters: int = 5000
     eval_interval: int = 250
