@@ -160,27 +160,15 @@ class HGRNBlock(nn.Module):
         for t in range(T):
             xt = x[:, t, :]
             
-            if self.training and T > 1:
-                # Gradient checkpointing: no guarda activaciones intermedias
-                # para ahorrar VRAM (recalcula en el backward)
-                f, i = torch.utils.checkpoint.checkpoint(
-                    self._compute_gates, xt)
-            else:
-                f, i = self._compute_gates(xt)
-            
+            f = torch.sigmoid(self.forget(xt))
             f = torch.clamp(f, min=self.lower_bound)
+            i = torch.sigmoid(self.input_gate(xt))
             
             h = (1 - f) * h + f * i
             o = self.out_proj(self.norm(h))
             outputs.append(o)
         
         return torch.stack(outputs, dim=1), h
-    
-    def _compute_gates(self, xt):
-        """Separa el cómputo de gates para checkpointing."""
-        f = torch.sigmoid(self.forget(xt))
-        i = torch.sigmoid(self.input_gate(xt))
-        return f, i
 
 # -----------------------------------------------------------------------------
 # Transformer Block
