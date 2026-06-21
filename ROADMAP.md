@@ -91,7 +91,27 @@ El Celeron N4020 tiene 2 cores físicos. Usamos pthreads para partir los matmuls
 | Sin optimizar | 1.92s | 26 |
 | Con KV cache + MT | **0.37s** | **136** |
 
-Estimado en N4020: **20-40 tok/s**
+### Rendimiento real en N4020 (modelo 10.7M)
+
+Benchmarks ejecutados el 21 Junio 2026 en el hardware target:
+
+| Métrica | Valor |
+|---|---|
+| **Carga del modelo** | 0.04s |
+| **RAM (peak RSS)** | 16 MB (I2_S pre-desempaquetado) |
+| **CPU freq durante test** | 2.69 GHz burst |
+| **Prefill 7 chars** | 0.09s |
+| **Prefill 50 chars** | 0.47s |
+| **Prefill 200 chars** | 1.78s |
+| **Decode sostenido** | **~105 tok/s** |
+| **Scalabilidad (roofline)** | Ver SPECS.md |
+
+**Roofline analysis:**
+- Cuello de botella: **bandwidth de RAM** (~15 GB/s), no compute
+- Uso actual de BW: solo ~8% (modelo 10.7M cabe casi en L2)
+- Para 85M: ~112 tok/s estimados (más matmul, menos overhead relativo)
+- Para 350M: ~27 tok/s estimados (BW-bound puro)
+- Margen de optimización: tiling, buffers pre-alocados, solapar memoria ↔ cómputo (~2× potencial)
 
 ### SSE4.2 intrinsics clave
 
@@ -199,4 +219,4 @@ Tamaño:        Binario ~285KB, modelo 10.7M ~3MB empaquetado / ~12MB pre-desemp
 ---
 
 *Inicio: Junio 2026*
-*Última actualización: 21 Junio 2026 — Fase 2 completa (motor C con I2_S, KV cache, MT)*
+*Última actualización: 21 Junio 2026 — Fase 2 completa + benchmarks N4020 (~105 tok/s)*

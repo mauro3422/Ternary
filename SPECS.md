@@ -25,22 +25,37 @@
 | **Modelo máximo (GGUF Q4)** | ~3B params (~2.5 GB) |
 | **Modelo máximo (ternario 1.58-bit)** | ~2B params (~0.4 GB) |
 | **Velocidad esperada (transformer Q4)** | 1-4 tok/s |
-| **Velocidad esperada (ternario custom)** | 5-15 tok/s (estimado) |
+| **Velocidad medida (ternario 10.7M, Jun 2026)** | **105 tok/s decode** |
 | **Threads óptimos** | 2 (mismos que cores físicos) |
 | **Cuello de botella** | Ancho de banda de RAM (~15 GB/s) + sin AVX2 |
 
-### Estimaciones de velocidad por tamaño (motor C custom + SSE4.2)
+### Roofline Analysis (N4020)
 
-| Modelo ternario | Peso en RAM | tok/s estimado |
-|---|---|---|
-| 10.7M (6L/6H/384d) | ~2 MB | 200-500 |
-| 85M (12L/12H/768d) | ~17 MB | 80-200 |
-| 350M (24L/16H/1024d) | ~70 MB | 30-70 |
-| 1B | ~200 MB | 10-25 |
+| Recurso | Capacidad |
+|---|---|
+| **Peak compute** (2× SSE4.2 @ 2.7 GHz) | 86 GOPS |
+| **RAM bandwidth** | ~15 GB/s |
+| **Ridge point** (compute / BW) | 5.7 ops/byte |
+| **Intensidad aritmética del matmul ternario** | ~0.5 ops/byte (memoria-bound) |
 
-**Razonamiento:** El cuello de botella es la RAM (~15 GB/s). Cargar 70MB desde RAM cuesta ~5ms. El cómputo ternario (puras sumas/restas con `_mm_sign_epi8`) suma otros ~5-10ms. Total ~10-30ms/token → 30-100 tok/s reales.
+### Velocidad real medida vs proyecciones (motor C custom + SSE4.2)
 
-**En Python/PyTorch en el N4020** (sin motor C): ~1-3 tok/s por overhead del intérprete. El motor C custom es lo que da velocidad real.
+Benchmarks ejecutados el 21 Junio 2026 en el hardware target.
+
+| Modelo ternario | Peso I2_S (RAM) | tok/s real | tok/s estimado (roofline) |
+|---|---|---|---|
+| 10.7M (6L/6H/384d) | ~12 MB | **105** ✅ | ~112 (BW-bound, 8% eficiencia) |
+| 85M (12L/12H/768d) | ~96 MB | — | **~112** (más matmul, menos overhead) |
+| 350M (24L/16H/1024d) | ~400 MB | — | **~27** (BW-bound puro) |
+| 1B (30L/20H/1536d) | ~1.2 GB | — | **~9** (BW-bound) |
+
+**Razonamiento:** El cuello de botella es la RAM (~15 GB/s). Para 10.7M usamos solo 8% del BW porque el modelo es chico y el overhead (atención O(n²), allocs, threading) domina. Para 85M, los matmuls son más grandes y el overhead se diluye → misma velocidad a pesar de 8× más parámetros. Para 350M, el BW se satura y la velocidad baja linealmente con el tamaño.
+
+**Roofline key insight:** Todos los modelos son **memory-bandwidth bound**. El compute ternario con `_mm_sign_epi8` es tan eficiente (~1 ciclo/16 elementos) que nunca es el cuello de botella. Mejorar velocidad = mejorar eficiencia de bandwidth.
+
+**Margen de optimización:** ~2-3× potencial con tiling para L2 cache, buffers pre-alocados, y solapamiento memoria-cómputo.
+
+**En Python/PyTorch en el N4020** (sin motor C): ~1-3 tok/s.
 
 ## Capacidad de Parámetros Ternarios
 
@@ -50,7 +65,7 @@ Cada peso ternario almacena solo 1.58 bits (log₂(3) ≈ 1.58). Un peso float32
 |---|---|---|---|
 | 10.7M ternarios | 17M bits | ~0.5M params | ✅ Muy rápido pero limitado |
 | 85M ternarios | 135M bits | ~4M params | ✅ Buen balance |
-| 350M ternarios | 555M bits | ~17M params | ✅ Corre bien, 30-70 tok/s |
+| 350M ternarios | 555M bits | ~17M params | ✅ Corre bien, ~27 tok/s (estimado) |
 | 1B ternarios | 1.6G bits | ~50M params | ⚠️ Cabe en RAM, más lento |
 
 **Conclusión:** Más capas/layers = más pesos ternarios = más información guardada. 85M-350M es el punto dulce para este hardware.
@@ -184,7 +199,7 @@ export → GGUF (i2_s)              input: prompt → output: tokens
 - El buffer de cuantización debe ser tan grande como la entrada más grande (MLP fc: 4×n_embd, no n_embd).
 - El residual connection es crítico y fácil de olvidar al reescribir el forward.
 - MatMul-Free (HGRN) no es "versión tonta del transformer". Compite en calidad y es ideal para CPU porque inferencia es O(n) en vez de O(n²). Opción para Fase 4.
-- El motor C custom es indispensable para velocidad en el N4020. Python/PyTorch da ~1-3 tok/s. C con SSE4.2 + I2_S + KV cache da ~20-40 tok/s (estimado N4020).
+- El motor C custom es indispensable para velocidad en el N4020. Python/PyTorch da ~1-3 tok/s. C con SSE4.2 + I2_S + KV cache da **~105 tok/s** (medido, modelo 10.7M).
 - Liquid AI LFM2 corre 194 tok/s en 350M en un celular (Snapdragon). Son modelos propietarios pero validan la tesis de arquitecturas no-transformer para edge.
 
 **Arquitecturas investigadas (ver docs/ARQUITECTURAS_CPU.md):**
@@ -203,7 +218,14 @@ export → GGUF (i2_s)              input: prompt → output: tokens
 **Rendimiento medido (Ryzen 5600G, modelo 10.7M ternario):**
 - Sin optimizar: 26 tok/s
 - Con KV cache + multi-thread: **136 tok/s** (5.2× speedup)
-- Estimado N4020: **20-40 tok/s**
+
+**Rendimiento real N4020 (21 Jun 2026):**
+- Carga modelo: 0.04s
+- Prefill 7 chars: 0.09s / 200 chars: 1.78s
+- Decode sostenido: **~105 tok/s** (rango 103-114 según runs)
+- RAM peak: 16 MB
+- CPU: 2.69 GHz burst
+- Cuello de botella: RAM bandwidth (~15 GB/s), no compute
 
 **Si el training en Shakespeare funciona bien, después escalamos a:**
 - TinyStories (vocabulario ~1000 tokens)
