@@ -3,6 +3,5 @@ __pycache__/
 *.pyc
 .DS_Store
 checkpoint.pt
-engine/model.bin
-engine/tern.exe
+# engine/tern.exe
 data/shakespeare.txt
