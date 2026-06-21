@@ -60,7 +60,8 @@ def estimate_loss(model, dataset, config, device):
     for _ in range(config.eval_iters):
         x, y = dataset[np.random.randint(len(dataset))]
         x, y = x.unsqueeze(0).to(device), y.unsqueeze(0).to(device)
-        _, loss = model(x, y)
+        out = model(x, y)
+        loss = out[1] if isinstance(out, (list, tuple)) else out
         losses.append(loss.item())
     model.train()
     return float(torch.tensor(losses).mean())
@@ -133,7 +134,8 @@ def train():
         x = torch.stack(x_batch).to(device)
         y = torch.stack(y_batch).to(device)
         
-        logits, loss = m(x, y)
+        out = m(x, y)
+        loss = out[1] if isinstance(out, (list, tuple)) else out
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -161,8 +163,13 @@ def train():
     print("\n=== GENERACIÓN DE EJEMPLO ===")
     m.eval()
     context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    y = m.generate(context, max_new_tokens=200, temperature=0.8)
-    generated = ''.join([dataset.itos[i] for i in y[0].tolist()])
+    if config.use_hgrn:
+        state = m.init_hgrn_state(1, device)
+        y, _ = m.generate(context, max_new_tokens=200, temperature=0.8, state=state)
+        generated = ''.join([dataset.itos[i] for i in y[0].tolist()])
+    else:
+        y = m.generate(context, max_new_tokens=200, temperature=0.8)
+        generated = ''.join([dataset.itos[i] for i in y[0].tolist()])
     print(generated)
     
     print("\n=== MODELO LISTO ===")

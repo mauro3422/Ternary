@@ -26,5 +26,8 @@ class GPTConfig:
     warmup_iters: int = 1000
     
     # BitNet específico
-    ternary_threshold: float = 0.7  # 0.7 * mean(|w|) como en BitNet paper
-    no_weight_decay_ternary: bool = True  # no aplicar weight decay a capas ternarias
+    ternary_threshold: float = 0.7
+    no_weight_decay_ternary: bool = True
+    
+    # Arquitectura
+    use_hgrn: bool = False          # True = HGRN (MatMul-Free), False = Transformer
