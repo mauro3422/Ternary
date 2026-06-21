@@ -29,6 +29,32 @@
 | **Threads óptimos** | 2 (mismos que cores físicos) |
 | **Cuello de botella** | Ancho de banda de RAM (~15 GB/s) + sin AVX2 |
 
+### Estimaciones de velocidad por tamaño (motor C custom + SSE4.2)
+
+| Modelo ternario | Peso en RAM | tok/s estimado |
+|---|---|---|
+| 10.7M (6L/6H/384d) | ~2 MB | 200-500 |
+| 85M (12L/12H/768d) | ~17 MB | 80-200 |
+| 350M (24L/16H/1024d) | ~70 MB | 30-70 |
+| 1B | ~200 MB | 10-25 |
+
+**Razonamiento:** El cuello de botella es la RAM (~15 GB/s). Cargar 70MB desde RAM cuesta ~5ms. El cómputo ternario (puras sumas/restas con `_mm_sign_epi8`) suma otros ~5-10ms. Total ~10-30ms/token → 30-100 tok/s reales.
+
+**En Python/PyTorch en el N4020** (sin motor C): ~1-3 tok/s por overhead del intérprete. El motor C custom es lo que da velocidad real.
+
+## Capacidad de Parámetros Ternarios
+
+Cada peso ternario almacena solo 1.58 bits (log₂(3) ≈ 1.58). Un peso float32 almacena 32 bits. Para compensar la pérdida de precisión, necesitamos ~20× más parámetros ternarios que float32 para igual capacidad expresiva.
+
+| Modelo | Bits totales | Equiv. float32 | Viabilidad en N4020 |
+|---|---|---|---|
+| 10.7M ternarios | 17M bits | ~0.5M params | ✅ Muy rápido pero limitado |
+| 85M ternarios | 135M bits | ~4M params | ✅ Buen balance |
+| 350M ternarios | 555M bits | ~17M params | ✅ Corre bien, 30-70 tok/s |
+| 1B ternarios | 1.6G bits | ~50M params | ⚠️ Cabe en RAM, más lento |
+
+**Conclusión:** Más capas/layers = más pesos ternarios = más información guardada. 85M-350M es el punto dulce para este hardware.
+
 ## Software Instalado en PC Chica
 
 ### Global
@@ -139,16 +165,23 @@ export → GGUF (i2_s)              input: prompt → output: tokens
 
 **Decisiones de diseño:**
 - Ternario {-1, 0, +1} para evitar multiplicaciones de floats
-- SSE4.2 tiene `_mm_sign_epi8` que hace ×{-1,0,+1} para 16 valores a la vez
+- SSSE3 tiene `_mm_sign_epi8` que hace ×{-1,0,+1} para 16 valores a la vez (N4020 lo soporta)
 - RMSNorm (no LayerNorm, como BitNet)
 - Sin weight decay en capas ternarias
 - Contexto 256 tokens (no más, para mantener velocidad)
 - Vocabulario 65 caracteres (Shakespeare) como prueba de concepto
 
+**Lecciones aprendidas (Junio 2026):**
+- Un peso ternario guarda 1.58 bits vs 32 bits de uno float32. Para igual capacidad se necesitan ~20× más parámetros. Por eso escalar de 10.7M → 85M → 350M es necesario.
+- Más layers/embedding = más pesos ternarios = más capacidad de aprendizaje. No es "más tonto", es compensar la baja precisión por cantidad.
+- GELU en el MLP introduce multiplicaciones float. En el motor C se resolverá con lookup table o ReLU.
+- MatMul-Free (HGRN) no es "versión tonta del transformer". Compite en calidad y es ideal para CPU porque inferencia es O(n) en vez de O(n²). Opción para Fase 4.
+- El motor C custom es indispensable para velocidad en el N4020. Python/PyTorch da ~1-3 tok/s. C con SSE4.2 da ~30-100 tok/s.
+
 **Si el training en Shakespeare funciona bien, después escalamos a:**
 - TinyStories (vocabulario ~1000 tokens)
 - Dataset JSON (generación estructurada)
-- Modelo más grande (~85M params, 12 layers)
+- Modelo más grande (primero 85M, luego 350M si el hardware lo aguanta)
 
 ---
 

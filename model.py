@@ -31,12 +31,12 @@ class BitLinear(nn.Module):
     - Forward: usa pesos ternarizados
     - Backward: STE — el gradiente ignora la ternarización
     """
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, bias=True, threshold=0.7):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.threshold = threshold
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
-        # Inicialización adaptada: escala para compensar la ternarización
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
@@ -44,8 +44,7 @@ class BitLinear(nn.Module):
             self.register_parameter('bias', None)
 
     def forward(self, x):
-        # Forward con pesos ternarizados
-        w_ternary = ternarize(self.weight)
+        w_ternary = ternarize(self.weight, self.threshold)
         
         # STE: el gradiente fluye a través de self.weight directamente
         # (PyTorch lo maneja automático porque w_ternary depende de self.weight
@@ -82,8 +81,8 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.c_attn = BitLinear(config.n_embd, 3 * config.n_embd, bias=False)
-        self.c_proj = BitLinear(config.n_embd, config.n_embd, bias=False)
+        self.c_attn = BitLinear(config.n_embd, 3 * config.n_embd, bias=False, threshold=config.ternary_threshold)
+        self.c_proj = BitLinear(config.n_embd, config.n_embd, bias=False, threshold=config.ternary_threshold)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
@@ -106,8 +105,8 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = BitLinear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = BitLinear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = BitLinear(config.n_embd, 4 * config.n_embd, bias=False, threshold=config.ternary_threshold)
+        self.c_proj = BitLinear(4 * config.n_embd, config.n_embd, bias=False, threshold=config.ternary_threshold)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -148,7 +147,7 @@ class GPT(nn.Module):
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f=nn.RMSNorm(config.n_embd),
         ))
-        self.lm_head = BitLinear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = BitLinear(config.n_embd, config.vocab_size, bias=False, threshold=config.ternary_threshold)
 
         # Weight tying: compartir pesos entre embedding y lm_head
         self.transformer.wte.weight = self.lm_head.weight

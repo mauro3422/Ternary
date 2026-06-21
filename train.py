@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import math
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from config import GPTConfig
@@ -65,8 +66,6 @@ def estimate_loss(model, dataset, config, device):
     return float(torch.tensor(losses).mean())
 
 def train():
-    import numpy as np  # solo para el eval
-    
     config = GPTConfig()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Usando dispositivo: {device}")
@@ -143,7 +142,7 @@ def train():
         if iter_num % config.eval_interval == 0 or iter_num == config.max_iters - 1:
             t1 = time.time()
             dt = t1 - t0
-            loss_val = loss.item()
+            loss_val = estimate_loss(m, dataset, config, device)
             tokens_per_sec = config.batch_size * config.block_size / dt
             print(f"iter {iter_num:5d} | loss {loss_val:.4f} | ppl {math.exp(loss_val):.2f} | "
                   f"lr {lr:.2e} | {tokens_per_sec:.0f} tok/s | {dt:.1f}s")
@@ -151,7 +150,7 @@ def train():
             if loss_val < best_loss:
                 best_loss = loss_val
                 torch.save(m.state_dict(), os.path.join(os.path.dirname(__file__), "checkpoint.pt"))
-                print(f"  → checkpoint guardado (loss {best_loss:.4f})")
+                print(f"  -> checkpoint guardado (loss {best_loss:.4f})")
             
             t0 = time.time()
     

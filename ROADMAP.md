@@ -22,6 +22,27 @@ Crear un transformer ternario {-1, 0, +1} completo: desde el entrenamiento hasta
 
 **Dependencias:** PyTorch, numpy (ya instalado)
 
+### Lecciones aprendidas (Junio 2026)
+
+#### Capacidad de parámetros ternarios
+Cada peso ternario almacena solo log₂(3) ≈ 1.58 bits. Para igualar la capacidad de un modelo float32, necesitamos ~20× más parámetros. Por eso escalar de 10.7M → 85M → 350M es clave para que el modelo aprenda bien.
+
+| Modelo | Bits totales | Equiv. float32 | Qué puede aprender |
+|---|---|---|---|
+| 10.7M ternarios (6L/6H/384d) | 17M bits | ~0.5M params | Patrones básicos, frases cortas |
+| 85M ternarios (12L/12H/768d) | 135M bits | ~4M params | Oraciones coherentes |
+| 350M ternarios (24L/16H/1024d) | 555M bits | ~17M params | Diálogo simple, texto estructurado |
+
+**Conclusión:** 10.7M es prueba de concepto. Para algo útil hay que escalar. Ternario es una compensación: menos bits por peso, pero los pesos se pueden hacer muy pequeños (1.58 bits) y la inferencia es rapidísima en SSE4.2.
+
+#### GELU en el motor C
+La activación GELU en el MLP (`model.py`) usa multiplicaciones de floats. Para la Fase 2 (motor C), hay que decidir:
+- **Opción A:** Lookup table de GELU (pre-calcular valores, ocupa ~1KB)
+- **Opción B:** Reemplazar por ReLU (solo `max(0, x)`, pura comparación)
+- **Opción C:** MatMul-Free (Fase 4 experimental, elimina atención y MLP por RNN)
+
+Por ahora dejamos GELU. En el motor C usaremos una lookup table.
+
 ---
 
 ## Fase 2: Motor de Inferencia Custom en C
@@ -41,13 +62,14 @@ Crear un transformer ternario {-1, 0, +1} completo: desde el entrenamiento hasta
 ### SSE4.2 intrinsics clave
 
 ```c
-#include <smmintrin.h>  // SSE4.2
+#include <tmmintrin.h>  // SSSE3 para _mm_sign_epi8
+#include <smmintrin.h>  // SSE4.2 para hadd, blend
 
-// Multiplicar 16 floats por signo ternario (×1, ×0, ×-1)
-__m128 sign = _mm_sign_epi8(valores, mascara_ternaria);
+// Multiplicar 16 int8 por signo ternario (×1, ×0, ×-1)
+__m128i sign = _mm_sign_epi8(valores, mascara_ternaria);
 
-// Sumar 16 floats horizontalmente
-__m128 sum = _mm_hadd_ps(a, b);
+// Sumar 8 enteros horizontalmente
+__m128i sum = _mm_hadd_epi32(a, b);
 ```
 
 ---
@@ -67,10 +89,32 @@ __m128 sum = _mm_hadd_ps(a, b);
 
 | Experimento | Qué |
 |---|---|
-| **MatMul-Free** | Reemplazar atención por HGRN (gated RNN) — 0 multiplicaciones |
+| **MatMul-Free** | Reemplazar atención + MLP por HGRN (gated RNN). Sin multiplicaciones de matrices, solo sumas/restas. No es "más tonto", compite con Transformers hasta ~1B params. Ideal para CPU débil porque inferencia es O(n) en vez de O(n²) |
 | **MoE ternario** | Varios expertos ternarios chicos, router aprende a elegir |
 | **JSON estructurado** | Entrenar en datos con formato para que genere JSON válido |
 | **Distillación** | TinyLlama enseña a nuestro modelo (teacher → student) |
+| **Trainer custom** | Reemplazar PyTorch con un entrenador minimalista en C++/Python. Sin autograd pesado, solo el forward/backward necesario para ternarios. Ideal para modelos chicos (<350M). Menos dependencias, más control, posiblemente más rápido por evitar overhead de Python en los loops |
+
+### Fase 5: Entrenador Custom (visión a futuro)
+
+Idea: crear un `tiny_train` en C++ que haga todo el training loop sin PyTorch.
+
+```
+tiny_train/
+├── tensor.h        → Tensor con autograd manual (solo para ternarios)
+├── layers.h        → Solo BitLinear, RMSNorm, atención (lo justo)
+├── optim.h         → AdamW simplificado (solo lo necesario para ternarios)
+├── data.h          → Loader de datasets chicos (Shakespeare, TinyStories)
+├── train.c         → Training loop compacto
+└── Makefile        → build en segundos
+```
+
+**Ventajas:**
+- Binario < 1MB (vs PyTorch ~3GB)
+- Sin Python overhead en el forward/backward
+- Customizas cada operación (como en inferencia)
+- Ideal para experimentos rápidos y modelos chicos
+- Misma base de código que el motor de inferencia (reutilizás layers)
 
 ---
 
