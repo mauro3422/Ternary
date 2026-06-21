@@ -36,16 +36,13 @@ def pack_ternary(weights):
 def export():
     device = 'cpu'
     
-    # Cargar config
     config = GPTConfig()
     
-    # Cargar texto para el tokenizer
     from train import CharDataset, get_shakespeare
     text = get_shakespeare()
     dataset = CharDataset(text, 1)
     config.vocab_size = dataset.vocab_size
     
-    # Crear modelo
     model = GPT(config)
     ckpt_path = os.path.join(os.path.dirname(__file__), 'checkpoint.pt')
     if not os.path.exists(ckpt_path):
@@ -56,9 +53,8 @@ def export():
     model.load_state_dict(state)
     model.eval()
     
-    print(f"Vocab: {dataset.vocab_size}")
-    print(f"Stoi: {dataset.stoi}")
-    print(f"Itos: {dataset.itos}")
+    is_hgrn = config.use_hgrn
+    print(f"Modelo: {'HGRN' if is_hgrn else 'Transformer'}")
     
     # Recolectar todos los pesos ternarizados
     ternary_weights = {}
@@ -72,47 +68,34 @@ def export():
     # Embedding (no ternario)
     emb_weight = model.transformer.wte.weight.detach().cpu().numpy().astype('float32')
     pos_emb_weight = model.transformer.wpe.weight.detach().cpu().numpy().astype('float32')
-    
-    # RMSNorm params (gamma)
     ln_f_weight = model.transformer.ln_f.weight.detach().cpu().numpy().astype('float32')
     
-    block_rms = []
-    for i in range(config.n_layer):
-        ln1 = model.transformer.h[i].ln_1.weight.detach().cpu().numpy().astype('float32')
-        ln2 = model.transformer.h[i].ln_2.weight.detach().cpu().numpy().astype('float32')
-        block_rms.append((ln1, ln2))
-    
-    # Escribir binario
     out_path = os.path.join(os.path.dirname(__file__), 'engine', 'model.bin')
     
     with open(out_path, 'wb') as f:
-        # -- MAGIC --
+        # MAGIC + HEADER
         f.write(b'TERN')
-        
-        # -- HEADER --
-        # vocab_size, block_size, n_layer, n_head, n_embd
-        header = struct.pack('IIIII',
-            config.vocab_size,
-            config.block_size,
-            config.n_layer,
-            config.n_head,
-            config.n_embd
+        # header: vocab_size, block_size, n_layer, n_head, n_embd, model_type
+        header = struct.pack('IIIIII',
+            config.vocab_size, config.block_size,
+            config.n_layer, config.n_head, config.n_embd,
+            1 if is_hgrn else 0
         )
         f.write(header)
         
-        # stoi mapping: 65 chars as bytes
-        stoi_bytes = bytearray(256)  # ASCII lookup table
+        # stoi (256 bytes)
+        stoi_bytes = bytearray(256)
         for c, i in dataset.stoi.items():
             stoi_bytes[ord(c)] = i
         f.write(bytes(stoi_bytes))
         
-        # itos mapping: 65 bytes, cada uno es el char
+        # itos (vocab_size bytes)
         itos_bytes = bytearray(config.vocab_size)
         for i, c in dataset.itos.items():
             itos_bytes[i] = ord(c)
         f.write(bytes(itos_bytes))
         
-        # -- TENSOR DATA --
+        # --- TENSOR DATA ---
         # embedding weights (float32)
         emb_bytes = emb_weight.tobytes()
         f.write(struct.pack('I', len(emb_bytes)))
@@ -128,35 +111,60 @@ def export():
         f.write(struct.pack('I', len(ln_f_bytes)))
         f.write(ln_f_bytes)
         
-        # For each block
-        for i in range(config.n_layer):
-            ln1, ln2 = block_rms[i]
-            
-            # RMS norm weights (float32)
-            ln1_bytes = ln1.tobytes()
-            f.write(struct.pack('I', len(ln1_bytes)))
-            f.write(ln1_bytes)
-            
-            ln2_bytes = ln2.tobytes()
-            f.write(struct.pack('I', len(ln2_bytes)))
-            f.write(ln2_bytes)
-            
-            # Attention: c_attn (3 * n_embd, n_embd), c_proj (n_embd, n_embd)
-            for proj_name in ['attn.c_attn', 'attn.c_proj', 'mlp.c_fc', 'mlp.c_proj']:
-                w_name = f'transformer.h.{i}.{proj_name}'
-                w = ternary_weights.get(w_name)
-                if w is not None:
-                    # Packed ternary weights
-                    packed = pack_ternary(w.ravel())
-                    f.write(struct.pack('II', w.shape[0], w.shape[1]))
-                    f.write(struct.pack('I', len(packed)))
-                    f.write(packed)
-                else:
-                    raise ValueError(f"Weight not found: {w_name}")
+        if is_hgrn:
+            # --- HGRN blocks ---
+            for i in range(config.n_layer):
+                block = model.transformer.h[i]
+                
+                # norm.weight (RMSNorm gamma, float32)
+                norm_bytes = block.norm.weight.detach().cpu().numpy().astype('float32').tobytes()
+                f.write(struct.pack('I', len(norm_bytes)))
+                f.write(norm_bytes)
+                
+                # forget.weight (ternary packed)
+                for sub in ['forget', 'input_gate', 'out_proj']:
+                    w = ternary_weights.get(f'transformer.h.{i}.{sub}')
+                    if w is not None:
+                        packed = pack_ternary(w.ravel())
+                        f.write(struct.pack('II', w.shape[0], w.shape[1]))
+                        f.write(struct.pack('I', len(packed)))
+                        f.write(packed)
+                    else:
+                        raise ValueError(f"Weight not found: transformer.h.{i}.{sub}")
+                
+                # forget.bias, input_gate.bias (float32)
+                for sub in ['forget', 'input_gate']:
+                    bias = getattr(block, sub).bias.detach().cpu().numpy().astype('float32')
+                    bias_bytes = bias.tobytes()
+                    f.write(struct.pack('I', len(bias_bytes)))
+                    f.write(bias_bytes)
+        else:
+            # --- Transformer blocks (existing logic) ---
+            for i in range(config.n_layer):
+                ln1 = model.transformer.h[i].ln_1.weight.detach().cpu().numpy().astype('float32')
+                ln2 = model.transformer.h[i].ln_2.weight.detach().cpu().numpy().astype('float32')
+                
+                ln1_bytes = ln1.tobytes()
+                f.write(struct.pack('I', len(ln1_bytes)))
+                f.write(ln1_bytes)
+                
+                ln2_bytes = ln2.tobytes()
+                f.write(struct.pack('I', len(ln2_bytes)))
+                f.write(ln2_bytes)
+                
+                for proj_name in ['attn.c_attn', 'attn.c_proj', 'mlp.c_fc', 'mlp.c_proj']:
+                    w_name = f'transformer.h.{i}.{proj_name}'
+                    w = ternary_weights.get(w_name)
+                    if w is not None:
+                        packed = pack_ternary(w.ravel())
+                        f.write(struct.pack('II', w.shape[0], w.shape[1]))
+                        f.write(struct.pack('I', len(packed)))
+                        f.write(packed)
+                    else:
+                        raise ValueError(f"Weight not found: {w_name}")
         
-        # lm_head (ternary, same as wte.weight due to weight tying)
-        for proj_name in ['lm_head']:
-            w_name = f'{proj_name}'
+        # lm_head (ternary)
+        for w_name in ['lm_head']:
             w = ternary_weights.get(w_name)
             if w is not None:
                 packed = pack_ternary(w.ravel())

@@ -58,7 +58,11 @@ def main():
         
         # Generar
         with torch.no_grad():
-            y = m.generate(context, max_new_tokens=200, temperature=0.8)
+            if config.use_hgrn:
+                state = m.init_hgrn_state(1, device)
+                y, _ = m.generate(context, max_new_tokens=200, temperature=0.8, state=state)
+            else:
+                y = m.generate(context, max_new_tokens=200, temperature=0.8)
         
         # Decodificar
         generated = ''.join([dataset.itos[i] for i in y[0].tolist()])

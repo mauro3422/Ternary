@@ -37,6 +37,7 @@ typedef struct {
     int n_head;
     int n_embd;
     int head_size;
+    int model_type;     // 0=Transformer, 1=HGRN
 
     uint8_t stoi[256];
     uint8_t* itos;
@@ -45,7 +46,16 @@ typedef struct {
     tensor_t wpe;
     tensor_t ln_f;
 
-    block_t* blocks;
+    block_t* blocks;        // usado en Transformer
+    // HGRN blocks (MatMul-Free)
+    struct {
+        tensor_t norm;      // RMSNorm gamma (n_embd, F32)
+        tensor_t forget_w;  // forget gate (n_embd, n_embd, I8)
+        tensor_t forget_b;  // forget bias (n_embd, F32)
+        tensor_t input_w;   // input gate (n_embd, n_embd, I8)
+        tensor_t input_b;   // input bias (n_embd, F32)
+        tensor_t out_w;     // output proj (n_embd, n_embd, I8)
+    }* hgrn_blocks;
 
     tensor_t lm_head;
 } transformer_model_t;
@@ -72,9 +82,12 @@ static int model_load(transformer_model_t* m, const char* path) {
     m->n_head      = header[3];
     m->n_embd      = header[4];
     m->head_size   = m->n_embd / m->n_head;
-    offset += 20;
+    m->model_type  = header[5];
+    offset += 24;
 
-    printf("Modelo: %d layers, %d heads, %d embd\n", m->n_layer, m->n_head, m->n_embd);
+    printf("Modelo: %s %d layers, %d heads, %d embd\n",
+           m->model_type ? "HGRN" : "Transformer",
+           m->n_layer, m->n_head, m->n_embd);
     printf("Vocab: %d, Block: %d\n", m->vocab_size, m->block_size);
 
     memcpy(m->stoi, buf + offset, 256);
@@ -97,29 +110,56 @@ static int model_load(transformer_model_t* m, const char* path) {
     LOAD_F32_TENSOR(m->wpe, m->block_size);
     LOAD_F32_TENSOR(m->ln_f, 1);
 
-    m->blocks = (block_t*)malloc(m->n_layer * sizeof(block_t));
-    if (!m->blocks) { free(buf); return 0; }
-    memset(m->blocks, 0, m->n_layer * sizeof(block_t));
+    #define LOAD_TERNARY_TENSOR_I8(dst) do { \
+        int r = *(int*)(buf + offset); offset += 4; \
+        int c = *(int*)(buf + offset); offset += 4; \
+        int sz = *(int*)(buf + offset); offset += 4; \
+        tensor_t packed = tensor_alloc(r, c, TERN_TERNARY); \
+        memcpy(packed.data, buf + offset, sz); \
+        offset += sz; \
+        (dst) = unpack_ternary_to_i8(&packed); \
+        tensor_free(&packed); \
+    } while(0)
 
-    for (int i = 0; i < m->n_layer; i++) {
-        LOAD_F32_TENSOR(m->blocks[i].ln_1, 1);
-        LOAD_F32_TENSOR(m->blocks[i].ln_2, 1);
+    if (m->model_type == 1) {
+        // --- HGRN blocks ---
+        m->hgrn_blocks = (void*)malloc(m->n_layer * sizeof(*m->hgrn_blocks));
+        if (!m->hgrn_blocks) { free(buf); return 0; }
+        memset(m->hgrn_blocks, 0, m->n_layer * sizeof(*m->hgrn_blocks));
 
-        #define LOAD_TERNARY_TENSOR_I8(dst) do { \
-            int r = *(int*)(buf + offset); offset += 4; \
-            int c = *(int*)(buf + offset); offset += 4; \
-            int sz = *(int*)(buf + offset); offset += 4; \
-            tensor_t packed = tensor_alloc(r, c, TERN_TERNARY); \
-            memcpy(packed.data, buf + offset, sz); \
-            offset += sz; \
-            (dst) = unpack_ternary_to_i8(&packed); \
-            tensor_free(&packed); \
-        } while(0)
+        for (int i = 0; i < m->n_layer; i++) {
+            LOAD_F32_TENSOR(m->hgrn_blocks[i].norm, 1);
 
-        LOAD_TERNARY_TENSOR_I8(m->blocks[i].c_attn);
-        LOAD_TERNARY_TENSOR_I8(m->blocks[i].c_proj);
-        LOAD_TERNARY_TENSOR_I8(m->blocks[i].mlp_fc);
-        LOAD_TERNARY_TENSOR_I8(m->blocks[i].mlp_proj);
+            LOAD_TERNARY_TENSOR_I8(m->hgrn_blocks[i].forget_w);
+            LOAD_TERNARY_TENSOR_I8(m->hgrn_blocks[i].input_w);
+            LOAD_TERNARY_TENSOR_I8(m->hgrn_blocks[i].out_w);
+
+            // forget bias (float32)
+            { int sz = *(int*)(buf + offset); offset += 4;
+              m->hgrn_blocks[i].forget_b = tensor_alloc(1, m->n_embd, TERN_F32);
+              memcpy(m->hgrn_blocks[i].forget_b.data, buf + offset, sz); offset += sz; }
+            // input bias (float32)
+            { int sz = *(int*)(buf + offset); offset += 4;
+              m->hgrn_blocks[i].input_b = tensor_alloc(1, m->n_embd, TERN_F32);
+              memcpy(m->hgrn_blocks[i].input_b.data, buf + offset, sz); offset += sz; }
+        }
+        m->blocks = NULL;
+    } else {
+        // --- Transformer blocks ---
+        m->blocks = (block_t*)malloc(m->n_layer * sizeof(block_t));
+        if (!m->blocks) { free(buf); return 0; }
+        memset(m->blocks, 0, m->n_layer * sizeof(block_t));
+        m->hgrn_blocks = NULL;
+
+        for (int i = 0; i < m->n_layer; i++) {
+            LOAD_F32_TENSOR(m->blocks[i].ln_1, 1);
+            LOAD_F32_TENSOR(m->blocks[i].ln_2, 1);
+
+            LOAD_TERNARY_TENSOR_I8(m->blocks[i].c_attn);
+            LOAD_TERNARY_TENSOR_I8(m->blocks[i].c_proj);
+            LOAD_TERNARY_TENSOR_I8(m->blocks[i].mlp_fc);
+            LOAD_TERNARY_TENSOR_I8(m->blocks[i].mlp_proj);
+        }
     }
 
     {   // lm_head (pre-unpack to i8)
@@ -143,6 +183,17 @@ static void model_free(transformer_model_t* m) {
     tensor_free(&m->wte);
     tensor_free(&m->wpe);
     tensor_free(&m->ln_f);
+    if (m->model_type == 1 && m->hgrn_blocks) {
+        for (int i = 0; i < m->n_layer; i++) {
+            tensor_free(&m->hgrn_blocks[i].norm);
+            tensor_free(&m->hgrn_blocks[i].forget_w);
+            tensor_free(&m->hgrn_blocks[i].forget_b);
+            tensor_free(&m->hgrn_blocks[i].input_w);
+            tensor_free(&m->hgrn_blocks[i].input_b);
+            tensor_free(&m->hgrn_blocks[i].out_w);
+        }
+        free(m->hgrn_blocks);
+    }
     if (m->blocks) {
         for (int i = 0; i < m->n_layer; i++) {
             tensor_free(&m->blocks[i].ln_1);
@@ -860,6 +911,110 @@ cleanup:
     free(x); free(x_ln1); free(qkv_all);
     free(attn_out); free(x_ln2); free(mlp_in); free(mlp_out);
     free(logits); free(x_int8); free(buf_int8);
+    return token;
+}
+
+// --- HGRN Decode (MatMul-Free) ---
+// Procesa 1 token con estado recurrente.
+// state_in/state_out: array de n_layer × n_embd floats (estado de cada capa)
+
+static inline float sigmoid_f(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+static int model_hgrn_decode(transformer_model_t* m, int input_token,
+                              float* state_in, float* state_out,
+                              float temperature, int top_k) {
+    int n_embd = m->n_embd;
+    int max_q = 4 * n_embd;
+
+    float* x = (float*)calloc(n_embd, sizeof(float));
+    float* x_int = (float*)malloc(n_embd * sizeof(float));    // for RMSNorm
+    float* out = (float*)malloc(n_embd * sizeof(float));
+    float* logits = (float*)malloc(m->vocab_size * sizeof(float));
+    int8_t* x_int8 = (int8_t*)malloc(max_q * sizeof(int8_t));
+
+    if (!x || !x_int || !out || !logits || !x_int8)
+        goto cleanup_h;
+
+    // Embedding
+    {
+        int token = input_token;
+        if (token < 0 || token >= m->vocab_size) token = 0;
+        float* wte_row = (float*)m->wte.data + token * n_embd;
+        float* wpe_row = (float*)m->wpe.data + 0 * n_embd;  // pos 0 siempre (1 token)
+        for (int i = 0; i < n_embd; i++) x[i] = wte_row[i] + wpe_row[i];
+    }
+
+    for (int l = 0; l < m->n_layer; l++) {
+        float* h = state_in + l * n_embd;          // estado previo
+        float* h_new = state_out + l * n_embd;      // nuevo estado
+
+        float* norm_gamma = (float*)m->hgrn_blocks[l].norm.data;
+        int8_t* f_w = (int8_t*)m->hgrn_blocks[l].forget_w.data;
+        float* f_b = (float*)m->hgrn_blocks[l].forget_b.data;
+        int8_t* i_w = (int8_t*)m->hgrn_blocks[l].input_w.data;
+        float* i_b = (float*)m->hgrn_blocks[l].input_b.data;
+        int8_t* o_w = (int8_t*)m->hgrn_blocks[l].out_w.data;
+
+        // RMSNorm input
+        rmsnorm(x_int, x, norm_gamma, n_embd, 1e-5f);
+
+        // Quantize to int8
+        quantize_row(x_int, x_int8, n_embd);
+
+        // Forget gate: f = sigmoid(W_f @ x + b_f)
+        // Input gate: i = sigmoid(W_i @ x + b_i)
+        float f_val, i_val;
+        {   // forget gate
+            int32_t score = dot_i8(x_int8, f_w, n_embd);
+            f_val = sigmoid_f((float)score * 0.01f + f_b[0]);
+        }
+        {   // input gate
+            int32_t score = dot_i8(x_int8, i_w, n_embd);
+            i_val = sigmoid_f((float)score * 0.01f + i_b[0]);
+        }
+
+        // Clamp forget gate with lower bound (hierarchical)
+        float lower_bound = 0.8f * l / (m->n_layer - 1.0f);
+        if (f_val < lower_bound) f_val = lower_bound;
+
+        // State update: h_new = (1-f)*h_prev + f*i
+        for (int i = 0; i < n_embd; i++) {
+            h_new[i] = (1.0f - f_val) * h[i] + f_val * i_val;
+        }
+
+        // Output projection: o = W_o @ h_new  (ternary matmul)
+        quantize_row(h_new, x_int8, n_embd);
+        {   int32_t score = dot_i8(x_int8, o_w, n_embd);
+            out[0] = (float)score * 0.01f;
+        }
+        // Copy to x for next layer (simplificado: vector escalar)
+        // Para una capa completa, usaríamos matmul (n_embd × n_embd)
+        // Por ahora: usar el score como x de la siguiente capa
+        for (int i = 0; i < n_embd; i++) {
+            int32_t score = dot_i8(x_int8, o_w + i * n_embd, n_embd);
+            x[i] = (float)score * 0.01f;
+        }
+    }
+
+    // Final RMSNorm
+    float* ln_f_gamma = (float*)m->ln_f.data;
+    rmsnorm(x, x, ln_f_gamma, n_embd, 1e-5f);
+
+    // LM Head
+    quantize_row(x, x_int8, n_embd);
+    int8_t* w_head = (int8_t*)m->lm_head.data;
+    for (int j = 0; j < m->vocab_size; j++) {
+        logits[j] = (float)dot_i8(x_int8, w_head + j * n_embd, n_embd) * 0.01f;
+    }
+
+    int token;
+    if (top_k > 0) token = sample_topk(logits, m->vocab_size, top_k, temperature);
+    else { softmax(logits, m->vocab_size); token = sample_token(logits, m->vocab_size, temperature); }
+
+cleanup_h:
+    free(x); free(x_int); free(out); free(logits); free(x_int8);
     return token;
 }
 

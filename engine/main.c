@@ -16,8 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef __linux__
 #include <sys/resource.h>
 #include <unistd.h>
+#endif
 
 #include "transformer.h"
 #include "tensor.h"
@@ -30,6 +32,7 @@ static double now_seconds(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+#ifdef __linux__
 static long peak_rss_kb(void) {
     FILE* f = fopen("/proc/self/status", "r");
     if (!f) return -1;
@@ -42,6 +45,9 @@ static long peak_rss_kb(void) {
     fclose(f);
     return rss;
 }
+#else
+static long peak_rss_kb(void) { return -1; }
+#endif
 
 // Tokenizar string de texto a IDs
 static int tokenize(const transformer_model_t* m, const char* text, int32_t* tokens, int max_tokens) {
@@ -145,8 +151,73 @@ int main(int argc, char** argv) {
         fflush(stdout);
     }
 
-    // Generar con KV Cache + Multi-thread
-    {
+    if (model.model_type == 1) {
+        // --- HGRN (MatMul-Free, sin KV cache) ---
+        int32_t tokens[1024];
+        int prompt_len = 0;
+        if (strlen(prompt) > 0) {
+            for (int i = 0; prompt[i]; i++) {
+                unsigned char c = (unsigned char)prompt[i];
+                tokens[i] = model.stoi[c];
+            }
+            prompt_len = (int)strlen(prompt);
+        }
+
+        float* state = (float*)calloc(model.n_layer * model.n_embd, sizeof(float));
+        float* state_next = (float*)malloc(model.n_layer * model.n_embd * sizeof(float));
+
+        if (!benchmark_mode) { printf("> %s", prompt); fflush(stdout); }
+
+        double t1 = now_seconds();
+        int decode_count = 0;
+        for (int i = 0; i < max_new_tokens; i++) {
+            int token = (i == 0 && prompt_len > 0) ? tokens[0] : 0;
+            if (i == 0 && prompt_len > 0) {
+                // Prefill: procesar prompt completo token por token
+                for (int p = 0; p < prompt_len; p++) {
+                    int next = model_hgrn_decode(&model, tokens[p],
+                                                  state, state_next,
+                                                  temperature, top_k);
+                    memcpy(state, state_next, model.n_layer * model.n_embd * sizeof(float));
+                    if (p == 0 && !benchmark_mode) {
+                        putchar((char)model.itos[next]); fflush(stdout);
+                    }
+                }
+                double prefill_t = now_seconds() - t1;
+                if (benchmark_mode) {
+                    printf("prefill_time_s: %.4f\n", prefill_t);
+                }
+                t1 = now_seconds();
+            } else {
+                int next = model_hgrn_decode(&model, tokens[0],
+                                              state, state_next,
+                                              temperature, top_k);
+                memcpy(state, state_next, model.n_layer * model.n_embd * sizeof(float));
+                if (!benchmark_mode) { putchar((char)model.itos[next]); fflush(stdout); }
+                tokens[0] = next;
+                decode_count++;
+            }
+        }
+        double decode_time = now_seconds() - t1;
+
+        if (!benchmark_mode) printf("\n");
+
+        if (benchmark_mode) {
+            printf("BENCHMARK\n");
+            printf("model_type: HGRN\n");
+            printf("model_size_mb: %.1f\n", 3.1);
+            printf("n_layer: %d\n", model.n_layer);
+            printf("n_embd: %d\n", model.n_embd);
+            printf("load_time_s: %.3f\n", load_time);
+            printf("decode_tokens: %d\n", decode_count);
+            printf("decode_time_s: %.3f\n", decode_time);
+            printf("decode_tok_s: %.1f\n", decode_count / decode_time);
+        }
+
+        free(state); free(state_next);
+
+    } else {
+        // --- Transformer con KV Cache + Multi-thread ---
         int32_t tokens[1024];
         int prompt_len = 0;
         if (strlen(prompt) > 0) {
@@ -158,54 +229,38 @@ int main(int argc, char** argv) {
         }
         int orig_prompt_len = prompt_len;
 
-        // Crear KV cache
         kv_cache_t cache = kv_cache_alloc(model.block_size, model.n_layer,
                                           model.n_embd, model.n_head);
         double prefill_time = 0;
         double decode_time = 0;
 
-        if (!benchmark_mode) {
-            printf("> %s", prompt);
-            fflush(stdout);
-        }
+        if (!benchmark_mode) { printf("> %s", prompt); fflush(stdout); }
 
-        // Prefill: procesar prompt completo
         double t1 = now_seconds();
         if (prompt_len > 0) {
             int first = model_prefill(&model, tokens, prompt_len, &cache,
                                        temperature, top_k);
             prefill_time = now_seconds() - t1;
-            if (!benchmark_mode) {
-                char c = (char)model.itos[first];
-                putchar(c);
-                fflush(stdout);
-            }
+            if (!benchmark_mode) { putchar((char)model.itos[first]); fflush(stdout); }
             tokens[0] = first;
-            prompt_len = 1;
         }
 
-        // Decode: generar tokens uno por uno con KV cache
         t1 = now_seconds();
         for (int i = 0; i < max_new_tokens - 1; i++) {
             int next = model_decode(&model, tokens[0], &cache,
                                      temperature, top_k);
-            if (!benchmark_mode) {
-                char c = (char)model.itos[next];
-                putchar(c);
-                fflush(stdout);
-            }
+            if (!benchmark_mode) { putchar((char)model.itos[next]); fflush(stdout); }
             tokens[0] = next;
         }
         decode_time = now_seconds() - t1;
 
         if (!benchmark_mode) printf("\n");
 
-        // --- Benchmark output ---
         if (benchmark_mode) {
-            int total_tokens = max_new_tokens;
-            int generated = max_new_tokens - (prompt_len > 0 ? 0 : 0);
+            int generated = max_new_tokens;
             double decode_tok_s = generated > 1 ? (generated - 1) / decode_time : 0;
             printf("BENCHMARK\n");
+            printf("model_type: Transformer\n");
             printf("model_size_mb: %.1f\n", 3.1);
             printf("params_m: 10.7\n");
             printf("n_layer: %d\n", model.n_layer);
