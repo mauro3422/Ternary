@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 @dataclass
 class HGRN350MConfig:
-    block_size: int = 256
+    block_size: int = 64
     vocab_size: int = 65
     n_layer: int = 48
     n_head: int = 1
